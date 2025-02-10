@@ -1,2 +1,6 @@
 gradio
 openai-whisper
+numpy
+sounddevice
+soundfile
+keyboard
