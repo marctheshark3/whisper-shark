@@ -10,6 +10,7 @@ import tempfile
 import os
 import time
 import logging
+from pynput.keyboard import Controller, Key
 
 class WhisperSharkGUI:
     # Unicode symbols that work well across platforms
@@ -17,6 +18,7 @@ class WhisperSharkGUI:
     ICON_STOP = "⏹"    # Stop square
     ICON_COPY = "⎘"    # Copy symbol
     ICON_CLOSE = "✕"   # Clean X
+    ICON_TYPE = "⌨"    # Keyboard icon
     
     def __init__(self, root):
         self.root = root
@@ -38,6 +40,9 @@ class WhisperSharkGUI:
         # Load Whisper model
         self.model = whisper.load_model("base")
         
+        # Initialize keyboard controller
+        self.keyboard = Controller()
+        
         # Recording variables
         self.is_recording = False
         self.audio_queue = queue.Queue()
@@ -45,6 +50,12 @@ class WhisperSharkGUI:
         self.sample_rate = 44100
         self.stream = None
         self._recording_lock = threading.Lock()
+        self.accumulated_audio = []
+        self.last_process_time = 0
+        self.PROCESS_INTERVAL = 2.0  # Process every 2 seconds
+        
+        # Mode settings
+        self.type_mode = True  # True for typing, False for clipboard
         
         self.create_widgets()
         self.setup_draggable()
@@ -120,7 +131,7 @@ class WhisperSharkGUI:
         
         # Title bar for dragging
         self.title_bar = ttk.Frame(main_frame, style="Title.TFrame")
-        self.title_bar.grid(row=0, column=0, columnspan=3, sticky="ew")
+        self.title_bar.grid(row=0, column=0, columnspan=4, sticky="ew")
         
         title_label = ttk.Label(
             self.title_bar,
@@ -128,6 +139,16 @@ class WhisperSharkGUI:
             style="Title.TLabel"
         )
         title_label.grid(row=0, column=0, padx=5, pady=2)
+        
+        # Mode toggle button
+        self.mode_button = ttk.Button(
+            self.title_bar,
+            text=self.ICON_TYPE,
+            width=2,
+            command=self.toggle_mode,
+            style="Icon.TButton"
+        )
+        self.mode_button.grid(row=0, column=1, padx=5, pady=1)
         
         # Close button
         close_button = ttk.Button(
@@ -137,43 +158,110 @@ class WhisperSharkGUI:
             command=self.on_closing,
             style="Icon.TButton"
         )
-        close_button.grid(row=0, column=1, sticky="e", padx=(0,1), pady=1)
+        close_button.grid(row=0, column=2, sticky="e", padx=(0,1), pady=1)
+        
+        # Control frame
+        control_frame = ttk.Frame(main_frame, style="Main.TFrame")
+        control_frame.grid(row=1, column=0, columnspan=4, sticky="ew")
         
         # Record button
         self.record_button = ttk.Button(
-            main_frame,
+            control_frame,
             text=self.ICON_RECORD,
             width=2,
             command=self.toggle_recording,
             style="Record.TButton"
         )
-        self.record_button.grid(row=1, column=0, padx=5, pady=5)
+        self.record_button.grid(row=0, column=0, padx=5, pady=5)
         
         # Status label
         self.status_label = ttk.Label(
-            main_frame,
+            control_frame,
             text="Ready",
             style="Status.TLabel"
         )
-        self.status_label.grid(row=1, column=1, padx=5, pady=5)
+        self.status_label.grid(row=0, column=1, padx=5, pady=5)
         
         # Copy button
         self.copy_button = ttk.Button(
-            main_frame,
+            control_frame,
             text=self.ICON_COPY,
             width=2,
             command=self.copy_last_text,
             state='disabled',
             style="Copy.TButton"
         )
-        self.copy_button.grid(row=1, column=2, padx=5, pady=5)
-        
-        self.last_transcribed_text = None
+        self.copy_button.grid(row=0, column=2, padx=5, pady=5)
         
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
+        control_frame.columnconfigure(1, weight=1)
+            
+    def toggle_mode(self):
+        """Toggle between typing and clipboard modes"""
+        self.type_mode = not self.type_mode
+        if self.type_mode:
+            self.mode_button.configure(text=self.ICON_TYPE)
+            self.status_label.configure(text="Type mode: Text will be typed")
+        else:
+            self.mode_button.configure(text=self.ICON_COPY)
+            self.status_label.configure(text="Copy mode: Text will be copied")
+        self.root.after(2000, lambda: self.status_label.configure(text="Ready"))
+            
+    def process_audio_chunk(self):
+        """Process accumulated audio if enough time has passed"""
+        current_time = time.time()
+        if (current_time - self.last_process_time >= self.PROCESS_INTERVAL and 
+            self.accumulated_audio and self.is_recording):
+            
+            # Create a copy of accumulated audio and clear the original
+            audio_to_process = np.concatenate(self.accumulated_audio.copy(), axis=0)
+            self.accumulated_audio = []
+            
+            # Save to temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
+                try:
+                    sf.write(temp_file.name, audio_to_process, self.sample_rate)
+                    result = self.model.transcribe(temp_file.name)
+                    
+                    # Type or copy the text
+                    if result["text"].strip():
+                        self.handle_transcribed_text(result["text"], intermediate=True)
+                        
+                except Exception as e:
+                    self.logger.error(f"Error processing audio chunk: {str(e)}")
+                finally:
+                    try:
+                        os.unlink(temp_file.name)
+                    except Exception as e:
+                        self.logger.error(f"Error deleting temp file: {str(e)}")
+                        
+            self.last_process_time = current_time
+            
+    def handle_transcribed_text(self, text, intermediate=False):
+        """Handle transcribed text based on current mode"""
+        if not text.strip():
+            return
+            
+        self.last_transcribed_text = text
+        
+        if self.type_mode:
+            # In type mode, type the text directly
+            if intermediate:
+                # For intermediate chunks, add a space after
+                self.keyboard.type(text + " ")
+            else:
+                # For final chunk, add newline
+                self.keyboard.type(text + "\n")
+        else:
+            # In copy mode, copy to clipboard
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.status_label.configure(text="Copied!")
+            
+        # Enable copy button
+        self.copy_button.configure(state='normal')
             
     def copy_last_text(self):
         """Copy the last transcribed text to clipboard"""
@@ -197,6 +285,8 @@ class WhisperSharkGUI:
             self.logger.warning(f"Audio callback status: {status}")
         try:
             self.audio_queue.put(indata.copy())
+            self.accumulated_audio.append(indata.copy())
+            self.process_audio_chunk()
         except Exception as e:
             self.logger.error(f"Error in audio callback: {str(e)}")
             
@@ -206,7 +296,8 @@ class WhisperSharkGUI:
             self.is_recording = True
             self.record_button.configure(text=self.ICON_STOP)
             self.status_label.configure(text="Recording...")
-            self.copy_button.configure(state='disabled')
+            self.accumulated_audio = []
+            self.last_process_time = time.time()
             
             # Clear the audio queue
             while not self.audio_queue.empty():
@@ -243,22 +334,16 @@ class WhisperSharkGUI:
         """Stop recording and process audio"""
         try:
             self.is_recording = False
-            self.status_label.configure(text="Processing...")
+            self.status_label.configure(text="Processing final chunk...")
             
             # Wait for recording thread to finish with timeout
             if self.recording_thread and self.recording_thread.is_alive():
                 self.recording_thread.join(timeout=2.0)
                 
-            # Process recorded audio
-            recorded_chunks = []
-            try:
-                while not self.audio_queue.empty():
-                    recorded_chunks.append(self.audio_queue.get_nowait())
-            except queue.Empty:
-                pass
-                
-            if recorded_chunks:
-                audio_data = np.concatenate(recorded_chunks, axis=0)
+            # Process any remaining audio
+            if self.accumulated_audio:
+                audio_data = np.concatenate(self.accumulated_audio, axis=0)
+                self.accumulated_audio = []
                 
                 # Save to temporary file
                 with tempfile.NamedTemporaryFile(delete=False, suffix='.wav') as temp_file:
@@ -267,15 +352,10 @@ class WhisperSharkGUI:
                         
                         # Transcribe
                         result = self.model.transcribe(temp_file.name)
-                        self.last_transcribed_text = result["text"]
-                        
-                        # Enable copy button and update status
-                        self.copy_button.configure(state='normal')
-                        self.status_label.configure(text="Ready - Click to copy")
-                        
-                        # Automatically copy to clipboard
-                        self.root.clipboard_clear()
-                        self.root.clipboard_append(self.last_transcribed_text)
+                        if result["text"].strip():
+                            self.handle_transcribed_text(result["text"], intermediate=False)
+                            
+                        self.status_label.configure(text="Ready")
                         
                     except Exception as e:
                         self.logger.error(f"Error processing audio: {str(e)}")
